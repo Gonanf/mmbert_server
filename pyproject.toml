@@ -1,0 +1,20 @@
+[project]
+name = "kateto-classifier-mmbert"
+version = "0.1.0"
+description = "mmBERT-based intent classifier server for Kateto (ONNX + Vulkan)"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "onnxruntime-gpu>=1.20",
+    "huggingface-hub>=0.27",
+    "tokenizers>=0.21",
+    "numpy>=2.0",
+    "httpx>=0.28",
+]
+
+[dependency-groups]
+dev = []
+
+[project.scripts]
+kateto-classifier = "server:main"
