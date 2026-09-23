@@ -110,7 +110,7 @@ Harrier-0.6b Q8_0 por llama.cpp en este host (4 hilos, servidor persistente):
 
 | Caso | p50 medido |
 |---|---|
-| Banclo EOT — 2497 turnos (7–70 tokens) | 27–113 ms |
+| Banco EOT — 2497 turnos (7–70 tokens) | 27–113 ms |
 | Smoke real — 5 llamadas mixtas | 72 ms |
 | MiniLM-L6 ONNX (encoder de producción) | ~11 ms |
 
