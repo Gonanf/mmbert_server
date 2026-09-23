@@ -14,7 +14,11 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = []
+dev = ["pytest>=8"]
+# train_heads.py corre con el python3 del sistema (tiene scikit-learn);
+# sklearn no se necesita para SERVIR (las cabezas son npz lineales) y por eso
+# vive en un grupo opcional, no en las dependencias de runtime.
+train = ["scikit-learn>=1.5"]
 
 [project.scripts]
 kateto-classifier = "server:main"

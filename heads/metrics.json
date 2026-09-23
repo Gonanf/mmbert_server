@@ -1,0 +1,29 @@
+{
+  "protocolo": "banco-eot/audit-ridge.py (seed 42, split 70/30, umbral F1 en val interna 20% del train)",
+  "embeddings": "/run/media/chaos/terciario/proyectos/kateto-medicion/banco-eot/out/harrier-0.6b.npy",
+  "semilla": 42,
+  "stage1": {
+    "nombre": "stage1_wait_asr_incompleto",
+    "n_train": 1398,
+    "n_test": 750,
+    "positivos_test": 30,
+    "acc": 0.896,
+    "recall_obj": 0.5333333333333333,
+    "precision_obj": 0.2,
+    "descarte": 0.9111111111111111,
+    "umbral": 0.0407880273127359,
+    "f1": 0.2909090909090909
+  },
+  "stage2": {
+    "nombre": "stage2_no_requiere",
+    "n_train": 389,
+    "n_test": 209,
+    "positivos_test": 100,
+    "acc": 0.8516746411483254,
+    "recall_obj": 0.73,
+    "precision_obj": 0.948051948051948,
+    "descarte": 0.963302752293578,
+    "umbral": 0.007670692169122084,
+    "f1": 0.824858757062147
+  }
+}

@@ -1,49 +1,324 @@
 """
-Minilm-based intent classifier server for Kateto.
+Clasificador de dos etapas para Kateto, sobre embeddings de harrier-oss-v1-0.6b
+y cabezas ridge entrenadas (no prototipos).
 
-Exposes POST /v1/chat/completions matching the ClassifierProvider contract.
-Uses ONNX Runtime with optional GPU acceleration.
+Pipeline en serie:
+  Etapa 1 — ¿terminó la idea?       wait_asr_incompleto  vs  turno completo
+  Etapa 2 — ¿requiere respuesta?    no_response*/no_llenar_silencio  vs  requiere
+  (solo si la etapa 1 dice "completo")
 
-Intent classification via embedding similarity:
-  - Mean-pooled last_hidden_state as sentence embedding (384-d)
-  - Cosine similarity to per-class prototype sentences
-  - Returns {category, confidence} in OpenAI-compatible format
+Veredicto:
+  etapa1 = incompleto  -> wait  -> category WAIT
+  etapa2 = no_requiere -> ignore -> IGNORE_SELF_TALK / IGNORE_THIRD_PARTY (espejo
+                                    por mención de un agente conocido en el texto)
+  etapa2 = requiere    -> exec  -> category EXECUTE
 
-Usage:
-    uv venv && uv pip sync requirements.txt
-    python server.py                          # default http://127.0.0.1:8091
-    python server.py --port 9091              # custom port
-    python server.py --model path/to/model    # local ONNX model
+Cabezas: heads/stage1.npz y heads/stage2.npz (RidgeClassifier lineal; thr elegido
+por F1 en validación interna durante el entrenamiento; cal_w/cal_b convierten la
+decisión lineal a proba). Entrenar con `python3 train_heads.py` (interprete del
+sistema, tiene scikit-learn).
+
+Backends de embeddings:
+  gguf  (default)  llama-server persistente (llama.cpp) sobre el GGUF Q8_0,
+                    --pooling mean --embd-normalize 2. La latencia servida mide
+                    ~30-115 ms p50 en este host (vs ~5-15 ms del MiniLM-L6 ONNX).
+  onnx             onnxruntime (MiniLM-L6 prod u otro BERT ONNX).
+
+Los prototipos heurísticos viejos quedan SOLO detrás de --legacy-prototypes
+(fallback declarado). Sin cabezas y sin el flag, el server no arranca.
+
+Endpoints (contrato OpenAI-compatible preservado):
+  POST /v1/chat/completions  -> {"choices":[{"message":{"content":
+                               "{\"category\":\"...\",\"confidence\":0.xx}"}}]}
+  POST /v1/classify          -> {"text","context","agents"} -> shape de dos etapas
+  GET  /health               -> backend, modelo, cabezas, p50 de latencia
+
+Uso:
+  python3 server.py                                # gguf, heads/ , detecta el GGUF
+  python3 server.py --backend onnx --embeddings-model Qdrant/all-MiniLM-L6-v2-onnx
+  python3 server.py --legacy-prototypes --backend onnx   # modo viejo, explícito
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import logging
-import math
+import os
+import shutil
+import socket
+import subprocess
 import sys
+import time
+import urllib.request
+from collections import deque
 from pathlib import Path
+from typing import Protocol, cast
 
 import numpy as np
-import onnxruntime as ort
-import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-from huggingface_hub import hf_hub_download
-from tokenizers import Tokenizer
 
 log = logging.getLogger("mmbert-server")
 
 # ---------------------------------------------------------------------------
-# Classification labels — must match kateto.core.event.Classification
+# Clasificación — debe matchear kateto.core.event.Classification
 # ---------------------------------------------------------------------------
 
-CATEGORIES = ("EXECUTE", "IGNORE_SELF_TALK", "IGNORE_THIRD_PARTY")
+CATEGORIES = ("EXECUTE", "IGNORE_SELF_TALK", "IGNORE_THIRD_PARTY", "WAIT")
 
-# Prototype sentences per category — embedded at startup for similarity matching
-# ponytail: heuristic prototypes, not trained. Swap for learned embeddings when
-# labeled data exists under classifiers/mmbert/training/.
+# Protege contra cargar los npz con un backend de dimensión equivocada.
+HARRIER_DIM = 1024
+
+# ---------------------------------------------------------------------------
+# Embedders
+# ---------------------------------------------------------------------------
+
+
+class GgufEmbedder:
+    """llama-server persistente (llama.cpp) como embedder HTTP.
+
+    Mismo modelo/flags que el banco: harrier-oss-v1-0.6b Q8_0, --pooling mean,
+    --embd-normalize 2, 4 hilos. Verificado contra el banco (cos >= 0.9999).
+    """
+
+    def __init__(self, model_path: Path, *, threads: int = 4, port: int = 0) -> None:
+        bin_path = shutil.which("llama-server")
+        if bin_path is None:
+            raise RuntimeError(
+                "backend=gguf require el binario `llama-server` (llama.cpp) en PATH"
+            )
+        if not Path(model_path).exists():
+            raise RuntimeError(f"modelo GGUF no encontrado: {model_path}")
+
+        if port == 0:
+            port = _free_port()
+        self.port = port
+        self.proc: subprocess.Popen[bytes] | None = subprocess.Popen(
+            [
+                bin_path, "-m", str(model_path),
+                "--port", str(port), "--host", "127.0.0.1",
+                "--embedding", "--pooling", "mean", "--embd-normalize", "2",
+                "-t", str(threads), "-c", "4096", "--no-webui",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        atexit.register(self.stop)
+        self._wait_ready(timeout=120)
+
+    def _wait_ready(self, timeout: float) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.proc is None or self.proc.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server murió al arrancar (rc={self.proc.returncode if self.proc else '?'})"
+                )
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health", timeout=1) as r:
+                    if json.loads(r.read()).get("status") == "ok":
+                        log.info("llama-server listo en 127.0.0.1:%d", self.port)
+                        return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise RuntimeError(f"llama-server no quedó listo en {timeout:.0f}s")
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        payload = json.dumps({"input": texts}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v1/embeddings",
+            data=payload, headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())["data"]
+        embs = np.array([d["embedding"] for d in data], dtype=np.float32)
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs / np.maximum(norms, 1e-12)
+
+    def dim(self) -> int:
+        return HARRIER_DIM  # verificado contra el banco al cargar
+
+    def stop(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(self.proc.pid), 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+            self.proc.wait(timeout=10)
+        self.proc = None
+
+
+class OnnxEmbedder:
+    """onnxruntime, mean-pooling de last_hidden_state (MiniLM-L6 prod u otro)."""
+
+    def __init__(self, model_ref: str, *, use_vulkan: bool = True) -> None:
+        import onnxruntime as ort
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+
+        ONNX_FILENAME = "model.onnx"
+
+        def _resolve(model_ref: str) -> Path:
+            p = Path(model_ref)
+            if p.exists():
+                return p if p.is_file() else p / ONNX_FILENAME
+            return Path(hf_hub_download(repo_id=model_ref, filename=ONNX_FILENAME,
+                                        local_files_only=False))
+
+        tokenizer_path = hf_hub_download(repo_id=model_ref, filename="tokenizer.json",
+                                         local_files_only=False)
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        model_path = _resolve(model_ref)
+        self._wait_onnx = True
+
+        providers = ["VulkanExecutionProvider", "CPUExecutionProvider"] if use_vulkan else ["CPUExecutionProvider"]
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        try:
+            self.session = ort.InferenceSession(str(model_path), sess_options=opts, providers=providers)
+        except Exception as exc:
+            if use_vulkan and "Vulkan" in str(exc):
+                log.warning("Vulkan no disponible (%s), CPU", exc)
+                self.session = ort.InferenceSession(str(model_path), sess_options=opts,
+                                                    providers=["CPUExecutionProvider"])
+            else:
+                raise
+        log.info("ONNX providers: %s", self.session.get_providers())
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        max_length = 128
+        encoded = self.tokenizer.encode_batch(texts)
+        input_ids = np.zeros((len(texts), max_length), dtype=np.int64)
+        attention_mask = np.zeros((len(texts), max_length), dtype=np.int64)
+        token_type_ids = np.zeros((len(texts), max_length), dtype=np.int64)
+        for i, enc in enumerate(encoded):
+            ids = enc.ids[:max_length]
+            input_ids[i, : len(ids)] = ids
+            attention_mask[i, : len(ids)] = 1
+
+        (last_hidden,) = self.session.run(
+            None, {"input_ids": input_ids, "attention_mask": attention_mask,
+                   "token_type_ids": token_type_ids}
+        )
+        last_hidden = np.asarray(last_hidden)
+        mask = attention_mask.astype(np.float32)[:, :, np.newaxis]
+        summed = np.sum(last_hidden * mask, axis=1)
+        counts = np.maximum(np.sum(attention_mask, axis=1, keepdims=True), 1e-9)
+        embs = summed / counts
+        norms = np.linalg.norm(embs, axis=1, keepdims=True)
+        return embs / np.where(norms == 0, 1.0, norms)
+
+    def dim(self) -> int:
+        return int(self.session.get_outputs()[0].shape[-1])
+
+    def stop(self) -> None:  # onnxruntime no tiene proceso externo
+        pass
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+# ---------------------------------------------------------------------------
+# Clasificadores
+# ---------------------------------------------------------------------------
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+class _Embedder(Protocol):
+    """Contrato de embedder: llama-server (gguf) u onnxruntime."""
+
+    def embed(self, texts: list[str]) -> np.ndarray: ...
+    def dim(self) -> int: ...
+
+
+class HeadClassifier:
+    """Dos cabezas ridge lineales entrenadas (train_heads.py)."""
+
+    def __init__(self, embedder: _Embedder, heads_dir: Path) -> None:
+        s1 = heads_dir / "stage1.npz"
+        s2 = heads_dir / "stage2.npz"
+        for p in (s1, s2):
+            if not p.exists():
+                raise RuntimeError(
+                    f"faltan cabezas: no está {p}. Corré `python3 train_heads.py` "
+                    f"o arrancá con --legacy-prototypes (fallback de prototipos)."
+                )
+        self.h1 = np.load(s1)
+        self.h2 = np.load(s2)
+        self.thr1 = float(self.h1["thr"])
+        self.thr2 = float(self.h2["thr"])
+        self.dim = int(self.h1["dim"])
+        if self.dim != embedder.dim():
+            raise RuntimeError(
+                f"dimensiones incompatibles: cabezas esperan {self.dim}-d "
+                f"pero el embedder devuelve {embedder.dim()}-d. Las cabezas se "
+                f"entrenaron sobre harrier-0.6b ({HARRIER_DIM}-d): usá "
+                f"--backend gguf con ese modelo, o entrená cabezas para este embedder."
+            )
+        self.embedder = embedder
+
+    def classify(self, text: str, agents: list[str] | None = None) -> dict[str, object]:
+        emb = self.embedder.embed([text])[0].astype(np.float64)
+
+        s1 = float(self.h1["coef"] @ emb + self.h1["intercept"])
+        p1 = float(_sigmoid(self.h1["cal_w"] * s1 + self.h1["cal_b"]))
+        label1 = "wait" if s1 >= self.thr1 else "done"
+
+        s2 = float(self.h2["coef"] @ emb + self.h2["intercept"])
+        p2 = float(_sigmoid(self.h2["cal_w"] * s2 + self.h2["cal_b"]))
+        label2 = "no_requiere" if s2 >= self.thr2 else "requiere"
+
+        if label1 == "wait":
+            verdict, category, conf = "wait", "WAIT", p1
+        elif label2 == "no_requiere":
+            mentioned = any(a.strip() and a.lower() in text.lower() for a in (agents or []))
+            category = "IGNORE_THIRD_PARTY" if mentioned else "IGNORE_SELF_TALK"
+            verdict, conf = "ignore", p2
+        else:
+            verdict, category, conf = "exec", "EXECUTE", p2
+
+        return {
+            "stage1": {"label": label1, "proba": round(p1, 4)},
+            "stage2": {"label": label2, "proba": round(p2, 4)},
+            "verdict": verdict,
+            "category": category,
+            "confidence": round(conf, 4),
+        }
+
+
+class PrototypeClassifier:
+    """Fallback legacy: prototipos heurísticos por centroide (solo --legacy-prototypes)."""
+
+    def __init__(self, embedder: _Embedder) -> None:
+        self.embedder = embedder
+        self._prototypes: dict[str, np.ndarray] = {}
+        for cat, sentences in PROTOTYPES.items():
+            center = self.embedder.embed(sentences).mean(axis=0)
+            center /= np.linalg.norm(center)
+            self._prototypes[cat] = center
+
+    def classify(self, text: str, agents: list[str] | None = None) -> tuple[str, float]:
+        emb = self.embedder.embed([text])[0]
+        sims = np.array([float(np.dot(emb, self._prototypes[c])) for c in CATEGORIES[:3]])
+        if agents:
+            if any(name.lower() in text.lower() for name in agents):
+                sims[CATEGORIES.index("EXECUTE")] += 0.25
+        best = int(np.argmax(sims))
+        sims -= sims.max()
+        probs = np.exp(sims * 2.0)
+        probs /= probs.sum()
+        return CATEGORIES[best], float(probs[best])
+
+
+# ---------------------------------------------------------------------------
+# Prototipos legacy (no se usan salvo --legacy-prototypes)
+# ---------------------------------------------------------------------------
+
 PROTOTYPES: dict[str, list[str]] = {
     "EXECUTE": [
         "tell me about the project status",
@@ -88,226 +363,24 @@ PROTOTYPES: dict[str, list[str]] = {
     ],
 }
 
-# ---------------------------------------------------------------------------
-# Model loading
-# ---------------------------------------------------------------------------
-
-MODEL_REPO = "Qdrant/all-MiniLM-L6-v2-onnx"
-ONNX_FILENAME = "model.onnx"
-CONFIG_FILENAME = "config.json"
-
-
-def _resolve_model_path(model_ref: str) -> Path:
-    """Return local path to the ONNX model file.
-
-    If *model_ref* looks like a filesystem path, use it directly.
-    Otherwise treat it as a HuggingFace Hub repo ID and download.
-    """
-    p = Path(model_ref)
-    if p.exists():
-        return p if p.is_file() else p / ONNX_FILENAME
-    # Download from HuggingFace Hub
-    return Path(
-        hf_hub_download(
-            repo_id=model_ref,
-            filename=ONNX_FILENAME,
-            local_files_only=False,
-        )
-    )
-
-
-def _load_tokenizer(model_repo: str) -> Tokenizer:
-    """Load the BERT-compatible WordPiece tokenizer from the Hub."""
-    tokenizer_path = hf_hub_download(
-        repo_id=model_repo,
-        filename="tokenizer.json",
-        local_files_only=False,
-    )
-    return Tokenizer.from_file(tokenizer_path)
-
-
-def _create_session(model_path: Path, *, use_vulkan: bool = True) -> ort.InferenceSession:
-    """Create an ONNX Runtime session with optional Vulkan GPU provider."""
-    providers = []
-    if use_vulkan:
-        providers.append("VulkanExecutionProvider")
-    providers.append("CPUExecutionProvider")
-
-    opts = ort.SessionOptions()
-    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    opts.enable_cpu_mem_arena = True
-    opts.enable_mem_pattern = True
-
-    try:
-        session = ort.InferenceSession(
-            str(model_path),
-            sess_options=opts,
-            providers=providers,
-        )
-    except Exception as exc:
-        if use_vulkan and "Vulkan" in str(exc):
-            log.warning("Vulkan provider unavailable (%s), falling back to CPU", exc)
-            session = ort.InferenceSession(
-                str(model_path),
-                sess_options=opts,
-                providers=["CPUExecutionProvider"],
-            )
-        else:
-            raise
-
-    active = session.get_providers()
-    log.info("ONNX Runtime providers: %s", active)
-    return session
-
-
-# ---------------------------------------------------------------------------
-# Embedding
-# ---------------------------------------------------------------------------
-
-def _tokenize(tokenizer: Tokenizer, texts: list[str], max_length: int = 128) -> dict[str, np.ndarray]:
-    """Tokenize a batch of texts for BERT ONNX input."""
-    encoded = tokenizer.encode_batch(texts)
-    input_ids = np.zeros((len(texts), max_length), dtype=np.int64)
-    attention_mask = np.zeros((len(texts), max_length), dtype=np.int64)
-    token_type_ids = np.zeros((len(texts), max_length), dtype=np.int64)
-
-    for i, enc in enumerate(encoded):
-        ids = enc.ids[:max_length]
-        length = len(ids)
-        input_ids[i, :length] = ids
-        attention_mask[i, :length] = 1
-        # token_type_ids stays zero (single-sentence input)
-
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "token_type_ids": token_type_ids,
-    }
-
-
-def _embed(session: ort.InferenceSession, tokenizer: Tokenizer, texts: list[str]) -> np.ndarray:
-    """Compute normalised sentence embeddings via mean pooling of last_hidden_state.
-
-    Returns shape (N, 384) — L2-normalised vectors.
-    """
-    inputs = _tokenize(tokenizer, texts)
-    outputs = session.run(None, inputs)
-    last_hidden = outputs[0]  # shape (N, seq_len, 384) — last_hidden_state
-
-    # Mean pool — average token embeddings weighted by attention_mask
-    mask = inputs["attention_mask"].astype(np.float32)
-    mask_expanded = mask[:, :, np.newaxis]  # (N, seq_len, 1)
-    summed = np.sum(last_hidden * mask_expanded, axis=1)
-    counts = np.maximum(np.sum(mask, axis=1, keepdims=True), 1e-9)
-    embeddings = summed / counts  # (N, 384)
-
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)  # guard against zero vectors
-    return embeddings / norms
-
-
-# ---------------------------------------------------------------------------
-# Similarity classifier
-# ---------------------------------------------------------------------------
-
-class PrototypeClassifier:
-    """Nearest-prototype classifier using cosine similarity of BERT embeddings."""
-
-    def __init__(self, session: ort.InferenceSession, tokenizer: Tokenizer) -> None:
-        self.session = session
-        self.tokenizer = tokenizer
-        self._prototype_embeddings: dict[str, np.ndarray] = {}
-        self._build_prototypes()
-
-    def _build_prototypes(self) -> None:
-        for cat, sentences in PROTOTYPES.items():
-            emb = _embed(self.session, self.tokenizer, sentences)
-            class_center = emb.mean(axis=0)  # centroid of per-class prototypes
-            class_center /= np.linalg.norm(class_center)  # re-normalise
-            self._prototype_embeddings[cat] = class_center
-            log.info(
-                "prototype %s: %d sentences, centroid norm=%.4f",
-                cat,
-                len(sentences),
-                np.linalg.norm(class_center),
-            )
-
-    def classify(self, text: str, agents: list[str] | None = None) -> tuple[str, float]:
-        """Return (category, confidence) for *text*.
-
-        If *agents* is provided and any name appears in *text*,
-        EXECUTE gets a +0.25 logit boost (addresses a known agent).
-        """
-        emb = _embed(self.session, self.tokenizer, [text])[0]
-        best_cat: str = CATEGORIES[-1]
-        best_sim = -1.0
-
-        sims = np.array([
-            float(np.dot(emb, self._prototype_embeddings[c]))
-            for c in CATEGORIES
-        ])
-
-        # Boost EXECUTE when text mentions a known agent name
-        if agents:
-            text_lower = text.lower()
-            if any(name.lower() in text_lower for name in agents):
-                sims[CATEGORIES.index("EXECUTE")] += 0.25
-
-        best_idx = int(np.argmax(sims))
-        best_cat = CATEGORIES[best_idx]
-        best_sim = float(sims[best_idx])
-
-        # Softmax confidence
-        sims -= sims.max()
-        exp_s = np.exp(sims * 2.0)
-        probs = exp_s / exp_s.sum()
-        confidence = float(probs[best_idx])
-
-        return best_cat, confidence
-
 
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="mmBERT Classifier", version="0.1.0")
-classifier: PrototypeClassifier | None = None
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-
-@app.on_event("startup")
-async def _noop() -> None:
-    """Keep ref for lifetime — classifier set in main() before uvicorn.run()."""
-    app.state.classifier = classifier
+app = FastAPI(title="mmBERT Classifier", version="0.2.0")
+# app.state.classifier se setea en main() antes de uvicorn.run()
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> JSONResponse:
-    """OpenAI-compatible chat completions endpoint.
-
-    Expected request body (matching ClassifierRequest):
-      {
-        "model": "classifier",
-        "messages": [
-          {"role": "system", "content": "..."},
-          {"role": "user", "content": "the text to classify"}
-        ],
-        "temperature": 0.0,
-        "stream": false,
-        "response_format": {"type": "json_object"}
-      }
-
-    Returns:
-      {
-        "choices": [{"message": {"content": "{\\"category\\": \\"EXECUTE\\", \\"confidence\\": 0.95}"}}]
-      }
-    """
+    """OpenAI-compatible (contrato que Kateto consume como provider)."""
     clf = app.state.classifier
     if clf is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "classifier not initialized"},
-        )
-
+        return JSONResponse(status_code=503, content={"error": "classifier not initialized"})
     try:
         body = await request.json()
     except Exception:
@@ -317,7 +390,6 @@ async def chat_completions(request: Request) -> JSONResponse:
     if not messages:
         return JSONResponse(status_code=400, content={"error": "messages required"})
 
-    # Extract the user message text (last user message)
     user_text = ""
     for msg in reversed(messages):
         if isinstance(msg, dict) and msg.get("role") in ("user", "system"):
@@ -326,88 +398,175 @@ async def chat_completions(request: Request) -> JSONResponse:
     if not user_text:
         return JSONResponse(status_code=400, content={"error": "no user message content"})
 
-    # Optional: list of known agent/speaker names to boost EXECUTE when addressed
     agents = body.get("agents", [])
+    t0 = time.perf_counter()
+    if isinstance(clf, HeadClassifier):
+        r = clf.classify(user_text, agents=agents)
+        category = cast(str, r["category"])
+        confidence = cast(float, r["confidence"])
+    else:
+        category, confidence = clf.classify(user_text)  # PrototypeClassifier -> (str, float)
+    _record_latency(time.perf_counter() - t0)
 
-    category, confidence = clf.classify(user_text, agents=agents)
     payload = json.dumps({"category": category, "confidence": round(confidence, 4)})
+    return JSONResponse(content={"choices": [{"message": {"content": payload}}]})
 
-    return JSONResponse(content={
-        "choices": [
-            {
-                "message": {"content": payload},
-            }
-        ],
-    })
+
+@app.post("/v1/classify")
+async def classify(request: Request) -> JSONResponse:
+    """Clasificación completa de dos etapas.
+
+    Body: {"text": "...", "context": ["...", ...] (<= 10 mensajes previos),
+           "agents": ["Jane", "Doktor"]}
+    Respuesta: {"stage1": {"label","proba"}, "stage2": {"label","proba"},
+                "verdict": "exec|wait|ignore", "category": "...", "confidence": 0.xx}
+    """
+    clf = app.state.classifier
+    if clf is None:
+        return JSONResponse(status_code=503, content={"error": "classifier not initialized"})
+    if not isinstance(clf, HeadClassifier):
+        return JSONResponse(status_code=409, content={
+            "error": "modo legacy (prototipos) no tiene etapas; usá cabezas entrenadas "
+                     "(entrená con train_heads.py y arrancá sin --legacy-prototypes)"
+        })
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "invalid JSON"})
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse(status_code=400, content={"error": "text (string) required"})
+
+    context = body.get("context", [])
+    agents = body.get("agents", [])
+    if not isinstance(context, list) or not all(isinstance(c, str) for c in context):
+        return JSONResponse(status_code=400, content={"error": "context must be list[str]"})
+    if len(context) > 10:
+        return JSONResponse(status_code=400, content={"error": "context max 10 messages"})
+    if not isinstance(agents, list) or not all(isinstance(a, str) for a in agents):
+        return JSONResponse(status_code=400, content={"error": "agents must be list[str]"})
+
+    # El contexto se valida pero no se usa: las cabezas se entrenaron sobre turnos
+    # individuales (textos.npy), clasificar con más texto los sacaría de distribución.
+    t0 = time.perf_counter()
+    r = clf.classify(text, agents=agents)
+    _record_latency(time.perf_counter() - t0)
+    return JSONResponse(content=r)
 
 
 @app.get("/health")
 async def health() -> JSONResponse:
-    return JSONResponse(content={"status": "ok"})
+    clf = app.state.classifier
+    return JSONResponse(content={
+        "status": "ok",
+        "backend": app.state.backend,
+        "model": app.state.model,
+        "heads_loaded": isinstance(clf, HeadClassifier),
+        "mode": "two-stage-heads" if isinstance(clf, HeadClassifier) else "legacy-prototypes",
+        "latency_p50_ms": _latency_p50(),
+        "n_calls": len(_LATENCIES),
+    })
+
+
+_LATENCIES: deque[float] = deque(maxlen=100)
+
+
+def _record_latency(seconds: float) -> None:
+    _LATENCIES.append(seconds * 1000.0)
+
+
+def _latency_p50() -> float | None:
+    if not _LATENCIES:
+        return None
+    return round(sorted(_LATENCIES)[len(_LATENCIES) // 2], 1)
 
 
 # ---------------------------------------------------------------------------
 # CLI entrypoint
 # ---------------------------------------------------------------------------
 
+DEFAULT_GGUF_GLOB = (
+    "/run/media/chaos/terciario/chaos-cache/gguf-eot/hub/"
+    "models--mradermacher--harrier-oss-v1-0.6b-GGUF/snapshots/*/harrier-oss-v1-0.6b.Q8_0.gguf"
+)
+MODEL_REPO_DEFAULT_ONNX = "Qdrant/all-MiniLM-L6-v2-onnx"  # encoder de producción (384-d)
+
+
+def _default_gguf() -> str:
+    hits = sorted(Path(DEFAULT_GGUF_GLOB).parent.glob("*.gguf")) if Path(DEFAULT_GGUF_GLOB).parent.exists() else []
+    if hits:
+        return str(hits[0])
+    return ""
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="mmBERT classifier server")
+    parser = argparse.ArgumentParser(description="Clasificador de dos etapas (harrier-0.6b + cabezas)")
+    parser.add_argument("--port", type=int, default=8091, help="HTTP port (default: 8091)")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument(
-        "--port",
-        type=int,
-        default=8091,
-        help="HTTP port (default: 8091, matches kateto classifier endpoint)",
+        "--backend", choices=("gguf", "onnx"), default="gguf",
+        help="backend de embeddings (default: gguf = llama.cpp persistente; "
+             "onnx = onnxruntime sobre --embeddings-model)",
     )
     parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Bind address (default: 127.0.0.1)",
+        "--embeddings-model", "--model", dest="embeddings_model", default=None,
+        help="ruta al GGUF (backend=gguf) o ruta/repo ONNX (backend=onnx). "
+             "Default gguf: detecta harrier-oss-v1-0.6b.Q8_0 en el cache de medición.",
     )
-    parser.add_argument(
-        "--model",
-        default=MODEL_REPO,
-        help=f"ONNX model path or HF repo ID (default: {MODEL_REPO})",
-    )
-    parser.add_argument(
-        "--no-vulkan",
-        action="store_true",
-        help="Disable Vulkan GPU provider, use CPU only",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
-    )
+    parser.add_argument("--heads-dir", type=Path, default=Path("heads"),
+                        help="directorio con stage1.npz y stage2.npz (default: heads/)")
+    parser.add_argument("--legacy-prototypes", action="store_true",
+                        help="usar los prototipos heurísticos viejos (sin cabezas)")
+    parser.add_argument("--no-vulkan", action="store_true", help="onnx: CPU only")
+    parser.add_argument("--llama-threads", type=int, default=4,
+                        help="hilos de llama-server (default: 4, el medido)")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                        datefmt="%H:%M:%S")
 
-    log.info("Loading tokenizer from %s ...", MODEL_REPO)
-    tokenizer = _load_tokenizer(MODEL_REPO)
+    model_ref = args.embeddings_model or (_default_gguf() if args.backend == "gguf" else MODEL_REPO_DEFAULT_ONNX)
+    if args.backend == "gguf" and not args.embeddings_model and not model_ref:
+        parser.error("no se encontró el GGUF de harrier en el cache y no pasaste --embeddings-model")
 
-    log.info("Loading ONNX model from %s ...", args.model)
-    model_path = _resolve_model_path(args.model)
-    log.info("Model file: %s (%d MB)", model_path, model_path.stat().st_size // 1024 // 1024)
+    log.info("Backend %s · modelo %s", args.backend, model_ref)
+    if args.backend == "gguf":
+        embedder: object = GgufEmbedder(Path(model_ref), threads=args.llama_threads)
+    else:
+        embedder = OnnxEmbedder(model_ref, use_vulkan=not args.no_vulkan)
 
-    session = _create_session(model_path, use_vulkan=not args.no_vulkan)
+    heads_dir = args.heads_dir
+    use_heads = not args.legacy_prototypes
+    if use_heads and not heads_dir.exists():
+        parser.error(
+            f"no hay cabezas en {heads_dir} y no pasaste --legacy-prototypes. "
+            f"Corré `python3 train_heads.py` (necesita scikit-learn en el intérprete) "
+            f"o arrancá con --legacy-prototypes para el fallback de prototipos."
+        )
 
-    log.info("Building prototype embeddings ...")
     global classifier
-    classifier = PrototypeClassifier(session, tokenizer)
-    log.info("Classifier ready (%d categories, %d dimensions)", len(CATEGORIES), 384)
+    if use_heads:
+        classifier = HeadClassifier(embedder, heads_dir)
+        log.info("Clasificador de dos etapas listo (dim=%d, thr1=%.4f, thr2=%.4f)",
+                 classifier.dim, classifier.thr1, classifier.thr2)
+    else:
+        classifier = PrototypeClassifier(embedder)
+        log.warning("MODO LEGACY: prototipos heurísticos (no entrenados). Dos etapas desactivadas.")
 
-    log.info("Starting server on %s:%d", args.host, args.port)
-    uvicorn.run(
-        app,
-        host=args.host,
-        port=args.port,
-        log_level=args.log_level.lower(),
-    )
+    app.state.classifier = classifier
+    app.state.backend = args.backend
+    app.state.model = model_ref
+
+    log.info("Arrancando server en %s:%d", args.host, args.port)
+    import uvicorn
+    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level.lower())
+
+
+classifier: object | None = None
 
 
 if __name__ == "__main__":
