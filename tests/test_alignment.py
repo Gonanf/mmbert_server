@@ -58,4 +58,5 @@ def test_cabezas_guardadas_coinciden_con_el_banco():
     for name in ("stage1.npz", "stage2.npz"):
         z = np.load(heads / name)
         assert int(z["dim"]) == 1024, f"{name} espera {z['dim']}-d, el banco es 1024-d"
+        assert z["coef"].shape == (1024,), f"{name}: coef debe ser vector 1024-d (es {z['coef'].shape})"
     assert (heads / "metrics.json").exists(), "falta metrics.json (entregable de train_heads.py)"

@@ -494,7 +494,9 @@ MODEL_REPO_DEFAULT_ONNX = "Qdrant/all-MiniLM-L6-v2-onnx"  # encoder de producciÃ
 
 
 def _default_gguf() -> str:
-    hits = sorted(Path(DEFAULT_GGUF_GLOB).parent.glob("*.gguf")) if Path(DEFAULT_GGUF_GLOB).parent.exists() else []
+    # Path(DEFAULT_GGUF_GLOB).parent es "snapshots/*" (un glob, no una dir real)
+    snaps = Path(DEFAULT_GGUF_GLOB).parent.parent
+    hits = sorted(Path(snaps).glob("*/harrier-oss-v1-0.6b.Q8_0.gguf")) if snaps.exists() else []
     if hits:
         return str(hits[0])
     return ""

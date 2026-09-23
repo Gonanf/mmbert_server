@@ -1,133 +1,132 @@
-<p align="center">
-  <img src="assets/banner.png" alt="mmbert_server" width="100%">
-</p>
+# mmbert_server
 
-<h1 align="center">mmbert_server</h1>
+Clasificador de intención para **Kateto** en dos etapas, sobre embeddings de
+`harrier-oss-v1-0.6b` y **cabezas ridge entrenadas** (no prototipos heurísticos).
 
-<p align="center"><b>A single-file ONNX intent-classifier server that exposes an OpenAI-compatible endpoint for Kateto.</b></p>
+## Pipeline
 
-<p align="center">
-  <img alt="state" src="https://img.shields.io/badge/state-prototype-orange">
-  <img alt="language" src="https://img.shields.io/badge/python-%3E%3D3.12-blue">
-  <img alt="license" src="https://img.shields.io/badge/license-none-lightgrey">
-  <img alt="last activity" src="https://img.shields.io/badge/last_activity-2026--07-lightgrey">
-</p>
+```
+Etapa 1 — ¿terminó la idea?   wait_asr_incompleto  vs  turno completo
+Etapa 2 — ¿requiere respuesta?  (solo si la etapa 1 dice "completo")
+           no_response* / no_llenar_silencio  vs  requiere
+```
 
----
+| Veredicto | Categoría | Significado |
+|---|---|---|
+| `wait` | `WAIT` | el ASR cortó a mitad de frase; hay que esperar más audio |
+| `exec` | `EXECUTE` | requiere respuesta |
+| `ignore` | `IGNORE_SELF_TALK` / `IGNORE_THIRD_PARTY` | no requiere respuesta; el espejo va a `IGNORE_THIRD_PARTY` si el texto menciona un agente conocido (`agents`) |
 
-## What it is
+Las cabezas se entrenan sobre las etiquetas del banco (ver `train_heads.py`);
+cada una es un `RidgeClassifier` lineal con umbral elegido por F1 sobre una
+partición interna del train y calibración logística a `proba`. El protocolo
+exacto (shuffle semilla fija, split 70/30, pesos de clase) es el mismo del
+evaluador del banco (`audit-ridge.py`): los números son reproducibles.
 
-`mmbert_server` (package name `kateto-classifier-mmbert`) is a small HTTP server that classifies the
-intent of a chat message into one of three categories — `EXECUTE`, `IGNORE_SELF_TALK`,
-`IGNORE_THIRD_PARTY` — using embedding similarity instead of a trained classifier. It embeds text
-with MiniLM (`Qdrant/all-MiniLM-L6-v2-onnx`, 384-d, mean-pooled, L2-normalised), compares it by
-cosine similarity against per-class prototype sentence centroids, and returns
-`{"category": ..., "confidence": ...}` wrapped in an OpenAI-compatible
-`POST /v1/chat/completions` response, so it can plug into anything expecting that shape
-(in practice: Kateto's `ClassifierProvider` contract).
+## Endpoints
 
-**In one sentence:** it decides whether a chat utterance is addressed to the assistant or is
-self-talk / third-party chatter, so the agent only acts on messages meant for it.
+Todos responden JSON. El server mantiene el contrato OpenAI-compatible que
+consume Kateto (`/v1/chat/completions`) y agrega el endpoint explícito.
 
-## State
+### `POST /v1/classify`
 
-| | |
+```bash
+curl -s localhost:8091/v1/classify \
+  -H 'Content-Type: application/json' \
+  -d '{"text": "y después me dijo que le parecía", "context": [], "agents": ["Jane", "Doktor"]}'
+```
+
+```json
+{"stage1": {"label": "wait", "proba": 0.4133},
+ "stage2": {"label": "requiere", "proba": 0.238},
+ "verdict": "wait", "category": "WAIT", "confidence": 0.4133}
+```
+
+`context` = hasta 10 mensajes previos (se valida; el clasificador decide sobre
+`text` solo: las cabezas se entrenaron sobre turnos sueltos).
+
+### `POST /v1/chat/completions`
+
+Mismo shape de respuesta de siempre (lo consume Kateto como provider
+OpenAI-compatible):
+
+```bash
+curl -s localhost:8091/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "classifier", "messages": [{"role": "user", "content": "y después me dijo que le parecía"}]}'
+```
+
+```json
+{"choices": [{"message": {"content": "{\"category\": \"WAIT\", \"confidence\": 0.4133}"}}]}
+```
+
+### `GET /health`
+
+```json
+{"status": "ok", "backend": "gguf", "model": "<ruta>",
+ "heads_loaded": true, "mode": "two-stage-heads",
+ "latency_p50_ms": 72.4, "n_calls": 5}
+```
+
+## Cómo correr
+
+```bash
+python3 server.py                          # gguf (default), cabezas de heads/, puerto 8091
+python3 server.py --backend onnx --embeddings-model Qdrant/all-MiniLM-L6-v2-onnx
+python3 server.py --legacy-prototypes --backend onnx   # fallback de prototipos (explícito)
+```
+
+Flags: `--port`, `--host`, `--backend gguf|onnx`, `--embeddings-model <ruta|repo>`
+(alias: `--model`), `--heads-dir heads/`, `--legacy-prototypes`, `--no-vulkan`,
+`--llama-threads N`, `--log-level DEBUG|INFO|WARNING|ERROR`.
+
+- **gguf** (default): levanta `llama-server` (llama.cpp) en un puerto libre con
+  `--pooling mean --embd-normalize 2`, detecta el GGUF Q8_0 de harrier en el
+  cache (o pasale la ruta con `--embeddings-model`). El subproceso se mata solo
+  al salir.
+- **onnx**: onnxruntime; por defecto `Qdrant/all-MiniLM-L6-v2-onnx` (el encoder
+  de producción, 384-d). Si el modelo no está cacheado, se descarga con
+  huggingface_hub.
+
+Sin cabezas (`heads/stage1.npz`, `heads/stage2.npz`) y sin `--legacy-prototypes`
+el server no arranca: error claro.
+
+## Cómo entrenar las cabezas
+
+`train_heads.py` corre con el **python3 del sistema** (tiene scikit-learn; el
+venv de entrenamiento no). Reusa el protocolo de `audit-ridge.py` y verifica la
+alineación del banco antes de entrenar (falla ruidoso si no coincide).
+
+```bash
+python3 train_heads.py   # lee el banco + escenarios; escribe heads/{stage1,stage2}.npz + metrics.json
+```
+
+Métricas guardadas en `heads/metrics.json` (acc, recall/precisión de la clase
+objetivo, descarte, umbral por etapa).
+
+## Latencia medida
+
+Harrier-0.6b Q8_0 por llama.cpp en este host (4 hilos, servidor persistente):
+
+| Caso | p50 medido |
 |---|---|
-| **State** | prototype |
-| **Last activity** | 2026-07 (feat commits); docs generated 2026-09 |
-| **Usable today** | yes, as a local sidecar: `python server.py` and POST to `/v1/chat/completions` |
-| **What's missing** | no trained head (hand-written prototype sentences); no tests; no CI; no LICENSE; training pipeline not wired to `classifiers/mmbert/training/` |
-| **Known risks / debt** | prototypes are heuristic (noted in code as "ponytail"); the `agents` boost (+0.25 logit on substring match) is a blunt heuristic; single 400-line file; GPU path depends on a Vulkan-capable onnxruntime build |
+| Banclo EOT — 2497 turnos (7–70 tokens) | 27–113 ms |
+| Smoke real — 5 llamadas mixtas | 72 ms |
+| MiniLM-L6 ONNX (encoder de producción) | ~11 ms |
 
-## Why it exists
+`llama-server` persistente (server levantado) es ~2–10× más lento que el
+MiniLM ONNX; el trade-off compra precisión de clasificación (~95 % de
+precisión en la clase objetivo de la etapa 2 vs ~77 % del flujo prototipo).
+Medido, no estimado: `GET /health` reporta la p50 real de las últimas 100
+llamadas.
 
-Kateto (an agent orchestration project by the same author) needs to filter a chat stream:
-not everything said is directed at the agent. Rather than a full LLM call for every utterance,
-this runs a tiny local model (MiniLM via ONNX, optional Vulkan GPU) and answers in milliseconds,
-keeping the OpenAI-compatible response format so Kateto can swap providers.
-
-
-Requirements: Python ≥ 3.12, [uv](https://docs.astral.sh/uv/) (or plain pip), network access on
-first run (downloads tokenizer + ONNX model from HuggingFace Hub).
+## Tests
 
 ```bash
-# with uv (repo ships uv.lock)
-uv venv && uv sync
-uv run python server.py                 # http://127.0.0.1:8091
-
-# or with pip
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-python server.py
+python3 -m pytest tests/ -q
 ```
 
-Flags: `--port 9091`, `--host 0.0.0.0`, `--model path/to/model.onnx` (local path or HF repo id),
-`--no-vulkan` (CPU only), `--log-level DEBUG`.
-
-Example request:
-
-```bash
-curl -s localhost:8091/v1/chat/completions -H 'content-type: application/json' -d '{
-  "messages": [{"role": "user", "content": "good morning team, let us start the standup"}],
-  "agents": ["Jane"]
-}'
-# -> {"choices":[{"message":{"content":"{\"category\": \"EXECUTE\", \"confidence\": 0.xx}"}}]}
-```
-
-`GET /health` returns `{"status": "ok"}`.
-
-## Stack
-
-- **Language / runtime:** Python ≥ 3.12, single module (`server.py`), entry point `kateto-classifier = server:main`
-- **Main dependencies:** FastAPI + Uvicorn, `onnxruntime-gpu` (CPU + Vulkan execution providers), `tokenizers`, `huggingface-hub`, NumPy
-- **Model:** `all-MiniLM-L6-v2` ONNX from Qdrant (downloaded on first run, cached by HF Hub)
-- **Notably not used:** PyTorch / Transformers runtime (only the tokenizer + ONNX graph), and no vector DB — prototypes live in memory
-
-## Architecture
-
-Everything lives in one file, in clear stages:
-
-```
-tokenizer.json (HF Hub) ─┐
-model.onnx (HF Hub) ─────┴─► ONNX Runtime session ─► mean-pool + L2 norm ─► cosine vs 3 class centroids
-                                    ─► (+agents boost) ─► softmax confidence ─► OpenAI-shaped JSON
-```
-
-- `PROTOTYPES` — hand-written example sentences per category (English and Spanish), embedded once at startup into per-class centroids
-- `PrototypeClassifier` — nearest-centroid classification with cosine similarity; boosts `EXECUTE` when the text contains one of the known agent names
-- FastAPI app — `POST /v1/chat/completions` (last user/system message is the input; optional `agents` list) and `GET /health`
-
-## Repo structure
-
-```
-server.py         # the whole server: model loading, embedding, classifier, FastAPI app, CLI
-pyproject.toml    # package metadata and dependencies (uv-compatible)
-uv.lock           # locked dependency set
-docs/overview.md  # auto-generated overview (from a prior documentation batch)
-```
-
-## Roadmap
-
-- [x] ONNX + Vulkan inference, OpenAI-compatible endpoint
-- [ ] Replace heuristic prototypes with learned centroids from labeled data (`classifiers/mmbert/training/`)
-- [ ] Add tests and a minimal CI
-- [ ] Pin a proper license
-
-## Notes and decisions
-
-- **Similarity instead of a trained classifier:** with 3 coarse classes, centroid similarity over
-  hand-picked prototype sentences is enough to start; the code comments flag this explicitly as
-  temporary ("swap for learned embeddings when labeled data exists").
-- **Vulkan GPU:** `onnxruntime-gpu` is configured to try `VulkanExecutionProvider` first and fall
-  back to CPU automatically if Vulkan is unavailable — useful on machines without CUDA.
-- **OpenAI response shape:** the classifier result is JSON-encoded inside
-  `choices[0].message.content` so the server satisfies Kateto's `ClassifierProvider` contract
-  without a custom client.
-- The current `README.md` and `docs/overview.md` in the repo are auto-generated placeholders from a
-  batch documentation run (2026-09); this document is the real description.
-
-## License
-
-None declared. Private/personal project until the owner picks one (MIT or GPL-3.0 suggested).
-
----
+Backend falso determinista (síntetico, sin GPU ni modelo), umbrales aplicados,
+mapeo de verdict a categoría, errores claros sin cabezas/dimensiones
+incompatibles, contrato de los endpoints, y un test de alineación que falla si
+embeddings y etiquetas no coinciden (skip si el banco no está en disco).

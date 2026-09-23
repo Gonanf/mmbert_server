@@ -122,7 +122,8 @@ def probar(X: np.ndarray, y: np.ndarray, nombre: str) -> dict:
         descarte=descarte,
         umbral=float(thr),
         f1=float(2 * prec * recall / max(prec + recall, 1e-9)),
-        coef=clf.coef_[0].astype(np.float32),
+        # sklearn >= 1.x: coef_ es (n_features,) para binario (antes (1, n_features))
+        coef=np.ravel(clf.coef_).astype(np.float32),
         intercept=float(clf.intercept_[0]),
         cal_w=float(cal.coef_[0][0]),
         cal_b=float(cal.intercept_[0]),
